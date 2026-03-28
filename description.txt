@@ -1,0 +1,50 @@
+Polymarket 15-Minute Cryptocurrency Trading Bot
+I want to develop a commercial-grade automated trading bot that trades the 15-minute cryptocurrency bull/bear market (24/7) on Polymarket. The bot should continuously open positions on both bull/bear (YES) and bear (NO) markets during the 15-minute period, ensuring an average trading cost of less than $1 for YES+NO pairs. This should generate stable profits even after deducting fees and slippage.
+
+Bot Key Features
+
+Continuously monitors the currently active 15-minute cryptocurrency market (e.g., 15-minute BTC bull/bear market, ideally extending to ETH/SOL).
+
+Executes orders on both bull/bear (YES) and bear (NO) markets during each 15-minute market period.
+
+Reduce the average transaction cost of hedged exposures to less than $1 (with a settable target, e.g., $0.96 to $0.99) using an average bid/discount bid (DCA) strategy.
+
+Manage inventory to ensure that risk exposures are roughly hedged, or implement explicit hedging logic in case of uneven execution.
+
+Reliable Execution: Reliably handle partial executions, failed orders, sudden spread fluctuations, and order close times.
+
+Key Success Criteria: Generate net profit after accounting for fees and realistic slippage, and consistently demonstrate an average fee of less than $1 per YES+NO currency pair in a live operating environment.
+
+Profitability Requirements (Acceptance Criteria)
+
+We are not interested in bots that simply trade. Profitability must be demonstrated under realistic conditions.
+
+Please provide backtest or replay data using historical 15-minute chart data (or, if possible, sophisticated simulations using order book snapshots).
+
+Provide mock trading and small-scale real-time pilot mode and document the following:
+
+Average entry cost (YES+NO) for each hedged currency pair
+
+Actual cost compared to estimated commissions/slippage
+
+Net profit/loss by day and market timeframe
+
+The bot must not trade if it cannot meet its cost threshold (no forced executions with costs exceeding $1.00).
+
+(While future profits cannot be guaranteed, the implementation must demonstrate clear evidence of its ability to achieve the average cost target of less than $1.00 and demonstrate positive results in testing.)
+
+Features:
+
+Market Search: Automatically identify active 15-minute markets and update them for each timeframe.
+
+Order Management: Prefer limit orders; only selective market orders with strict safeguards are allowed.
+
+Risk Management: Maximum position per window, maximum daily spend, kill switch, circuit breaker.
+
+Logging/Telemetry: Output structured logs and summary statistics dashboard (CSV/JSON format available).
+
+Configuration file for threshold, size, market, and timing behavior settings.
+
+Gabagul buys continuously.
+
+He doesn't wait for limit orders to be filled.
