@@ -29,6 +29,8 @@ const defaults: StrategyConfig = {
     marketTiltEpsilon: 0.02,
     pairTiltImbalanceShares: 10,
     pairTiltMinElapsedSeconds: 45,
+    finalOneSidedHedgeSeconds: 30,
+    absoluteNoOrderSeconds: 2,
 };
 
 function fromEnv(key: string, parse: (s: string) => unknown): unknown {
@@ -91,6 +93,14 @@ export function loadStrategyConfig(): StrategyConfig {
         pairTiltMinElapsedSeconds: (fromEnv('PAIR_TILT_MIN_ELAPSED_SECONDS', parseInt) as number)
             ?? file.pairTiltMinElapsedSeconds
             ?? defaults.pairTiltMinElapsedSeconds,
+        finalOneSidedHedgeSeconds: (fromEnv('FINAL_ONE_SIDED_HEDGE_SECONDS', parseInt) as number)
+            ?? file.finalOneSidedHedgeSeconds
+            ?? defaults.finalOneSidedHedgeSeconds,
+        absoluteNoOrderSeconds: (fromEnv('ABSOLUTE_NO_ORDER_SECONDS', parseInt) as number)
+            ?? file.absoluteNoOrderSeconds
+            ?? defaults.absoluteNoOrderSeconds,
+        orderSpendBalanceFraction: (fromEnv('ORDER_SPEND_BALANCE_FRACTION', parseFloat) as number)
+            ?? file.orderSpendBalanceFraction,
     };
     return config;
 }

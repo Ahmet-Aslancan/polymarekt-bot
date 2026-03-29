@@ -120,6 +120,7 @@ function simulateOneWindow(windowNum: number, ticksPerWindow: number): WindowRes
             roundsThisWindow,
             lastExecutedSide,
             secondsLeft,
+            availableBalanceUsd: config.paperStartingBalanceUsd ?? 5000,
         });
         if (decision.action !== 'HOLD') {
             const side = decision.action === 'BUY_YES' ? 'YES' as const : 'NO' as const;

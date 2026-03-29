@@ -160,7 +160,7 @@ export async function placeLimitBuyOrder(
  *   - Requires bestAskPrice to verify slippage before placing
  *   - Rejects if best ask >= $0.99 (too expensive)
  *   - Caps slippage to maxSlippageBps above best ask
- *   - Size capped at config.orderSizeShares
+ *   - Amount capped at config.maxSingleOrderUsd (USD) when set, else config.orderSizeShares × limit price
  *   - FOK ensures the order fills entirely or not at all (no partial resting)
  */
 export async function placeMarketBuyOrder(
@@ -183,8 +183,12 @@ export async function placeMarketBuyOrder(
         const maxPrice = Math.min(bestAskPrice * slippageFactor, 0.99);
         const limitPrice = Math.round(maxPrice * 100) / 100;
 
-        // Safeguard 3: cap amount
-        const cappedAmount = Math.min(amountUsd, config.orderSizeShares * limitPrice);
+        // Safeguard 3: cap amount (prefer maxSingleOrderUsd when configured)
+        const maxSpendUsd =
+            config.maxSingleOrderUsd != null && config.maxSingleOrderUsd > 0
+                ? config.maxSingleOrderUsd
+                : config.orderSizeShares * limitPrice;
+        const cappedAmount = Math.min(amountUsd, maxSpendUsd);
 
         const tickSize = resolveTickSize(config);
 

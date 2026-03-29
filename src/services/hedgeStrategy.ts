@@ -149,18 +149,30 @@ export function violatesDualLegSettlementGate(s: WindowState): boolean {
  * Largest integer size in [minSize, initialSize] that passes simulated pair-cost ceiling
  * (when both sides > 0 after fill) and dual-leg settlement (when both sides > 0).
  * Skips settlement + strict pair-cost checks while still one-sided (first leg only).
+ * When bypassPairCostAndSettlement (forced opposite leg / survival hedge), only enforces CLOB $1 minimum —
+ * pair cost and settlement P/L gates are ignored so the hedge can complete even at a loss vs full wipeout.
  */
 export function clampBuySizeForSimulatedGates(
     state: WindowState,
     side: 'YES' | 'NO',
     price: number,
     initialSize: number,
-    config: StrategyConfig
+    config: StrategyConfig,
+    opts?: { bypassPairCostAndSettlement?: boolean }
 ): number {
     const minSize = Math.max(1, Math.floor(config.orderMinSize || 1));
-    const pairCostCeiling = Math.min(config.safetyMargin, config.targetPairCostMax);
     const CLOB_MIN_ORDER_USD = 1.0;
     let s = Math.floor(initialSize);
+
+    if (opts?.bypassPairCostAndSettlement) {
+        while (s >= minSize) {
+            if (price * s >= CLOB_MIN_ORDER_USD) return s;
+            s--;
+        }
+        return 0;
+    }
+
+    const pairCostCeiling = Math.min(config.safetyMargin, config.targetPairCostMax);
     while (s >= minSize) {
         if (price * s < CLOB_MIN_ORDER_USD) {
             s--;
@@ -199,6 +211,85 @@ function simulateState(
 function roundToTick(price: number, tickSize: number): number {
     if (tickSize <= 0) return price;
     return Math.round(price / tickSize) * tickSize;
+}
+
+const QTY_EPS = 1e-8;
+
+/**
+ * Only in the last N seconds before the window ends (see finalOneSidedHedgeSeconds): if the book is
+ * strictly one-sided, propose buying the opposite leg at the best ask (FOK/taker) to match share count.
+ * Pair-cost / settlement profit gates are bypassed here only — survival vs total loss on wrong resolution.
+ * Outside that window, returns null (normal reference strategy applies).
+ */
+export function buildFinalOneSidedHedgeDecision(
+    config: StrategyConfig,
+    state: WindowState,
+    bookYes: OrderBookSnapshot,
+    bookNo: OrderBookSnapshot,
+    secondsLeft: number
+): StrategyDecision | null {
+    const absCut = config.absoluteNoOrderSeconds ?? 2;
+    const finalSec = config.finalOneSidedHedgeSeconds ?? 30;
+    if (secondsLeft <= absCut || secondsLeft > finalSec) return null;
+
+    const yesOnly = state.qtyYes > QTY_EPS && state.qtyNo <= QTY_EPS;
+    const noOnly = state.qtyNo > QTY_EPS && state.qtyYes <= QTY_EPS;
+    if (!yesOnly && !noOnly) return null;
+    if (state.totalSpentUsd <= 0) return null;
+
+    const side: 'YES' | 'NO' = yesOnly ? 'NO' : 'YES';
+    const sharesTarget = Math.floor(yesOnly ? state.qtyYes : state.qtyNo);
+    if (sharesTarget < 1) {
+        return {
+            action: 'HOLD',
+            tokenId: '',
+            price: 0,
+            size: 0,
+            reason: 'Final hedge: filled leg < 1 share',
+        };
+    }
+
+    const tickSize = config.tickSize || 0.01;
+    const bestAskLevel = side === 'YES' ? bookYes.asks?.[0] : bookNo.asks?.[0];
+    if (!bestAskLevel || bestAskLevel.price <= 0) {
+        return {
+            action: 'HOLD',
+            tokenId: '',
+            price: 0,
+            size: 0,
+            reason: 'Final hedge: no ask on opposite leg',
+        };
+    }
+    const price = roundToTick(bestAskLevel.price, tickSize);
+
+    let size = sharesTarget;
+    if (config.maxSingleOrderUsd && price > 0) {
+        size = Math.min(size, Math.floor(config.maxSingleOrderUsd / price));
+    }
+    size = clampBuySizeForSimulatedGates(state, side, price, size, config, {
+        bypassPairCostAndSettlement: true,
+    });
+    const CLOB_MIN_ORDER_USD = 1.0;
+    if (size <= 0 || price * size < CLOB_MIN_ORDER_USD) {
+        return {
+            action: 'HOLD',
+            tokenId: '',
+            price: 0,
+            size: 0,
+            reason: 'Final hedge: no size meets $1 CLOB min (pair cost ignored)',
+        };
+    }
+
+    const tokenId = side === 'YES' ? bookYes.tokenId : bookNo.tokenId;
+    const { newPairCost } = simulateState(state, side, size, price);
+    return {
+        action: side === 'YES' ? 'BUY_YES' : 'BUY_NO',
+        tokenId,
+        price,
+        size,
+        reason: `Final survival hedge: ${size} ${side} @ ask (pair cost ignored, ${secondsLeft}s left) pairCost→${newPairCost.toFixed(4)}`,
+        simulatedPairCost: newPairCost,
+    };
 }
 
 /**
@@ -268,6 +359,9 @@ export function decide(
         };
     }
 
+    const finalHedge = buildFinalOneSidedHedgeDecision(config, state, bookYes, bookNo, secondsLeft);
+    if (finalHedge !== null) return finalHedge;
+
     const rounds = ctx?.roundsThisWindow ?? 0;
     const lastSide = ctx?.lastExecutedSide ?? null;
     let side = referencePickBuySide(
@@ -286,7 +380,9 @@ export function decide(
     const price = side === 'YES' ? yesBidPrice : noBidPrice;
     const tokenId = side === 'YES' ? bookYes.tokenId : bookNo.tokenId;
     const ladder = buildSizeLadderFromConfig(config);
-    let size = referencePickClipSize(state, price, secondsLeft, windowSec, config, ladder);
+    let size = referencePickClipSize(state, price, secondsLeft, windowSec, config, ladder, {
+        availableBalanceUsd: ctx?.availableBalanceUsd,
+    });
     size = Math.max(size, config.orderMinSize || 1);
 
     // Late-window parity: don't overshoot the hedge leg when we're just trying to balance.
@@ -306,7 +402,7 @@ export function decide(
         };
     }
 
-    const { newPairCost, newState } = simulateState(state, side, size, price);
+    const { newPairCost } = simulateState(state, side, size, price);
 
     return {
         action: side === 'YES' ? 'BUY_YES' : 'BUY_NO',

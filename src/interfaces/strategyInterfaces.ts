@@ -34,6 +34,11 @@ export interface StrategyConfig {
     feeBips: number;
     /** Max USD to spend on a single order (one side). Prevents oversized bets. */
     maxSingleOrderUsd?: number;
+    /**
+     * Cap each order’s notional at this fraction of available trading balance (e.g. 0.05 = 1/20).
+     * Tightened together with maxSingleOrderUsd (whichever is smaller). Requires balance passed into clip sizing.
+     */
+    orderSpendBalanceFraction?: number;
     /** Suppress per-tick console.log output (dashboard + file logs still active). Default: false */
     quietConsole?: boolean;
     /** When liveTrading is false, starting simulated balance in USD for paper trading (e.g. 5000). */
@@ -50,6 +55,13 @@ export interface StrategyConfig {
     sizeLadderShares?: number[];
     /** Force opposite leg every N completed orders (two-sided book; 0 = off). */
     forcedSwitchEveryNOrders?: number;
+    /**
+     * If only one leg (Up or Down) is held, force-buy the opposite at the ask in the last N seconds
+     * before expiry to match share counts (equal After PnL If Up / Down). Default 30.
+     */
+    finalOneSidedHedgeSeconds?: number;
+    /** No new orders when seconds to window end are at or below this (default 2). */
+    absoluteNoOrderSeconds?: number;
 }
 
 /** Current active market from Gamma API (binary YES/NO) */
@@ -120,6 +132,8 @@ export interface StrategyDecisionContext {
     roundsThisWindow: number;
     lastExecutedSide: 'YES' | 'NO' | null;
     secondsLeft: number;
+    /** USDC available for sizing when orderSpendBalanceFraction is set (Polymarket proxy or paper cash). */
+    availableBalanceUsd?: number;
 }
 
 /** Decision from strategy: what to do this tick */

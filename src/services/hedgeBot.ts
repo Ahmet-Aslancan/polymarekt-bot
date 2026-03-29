@@ -5,10 +5,12 @@
  * - Forced leg switch every N orders; warmup then mid-window-heavy clips (duration-scaled)
  * - Once both YES and NO are held, clip size is clamped so pair cost and dual-leg settlement
  *   (After PnL If Up/Down ≥ 0) pass; first leg only is not subject to the settlement gate.
+ * - In the last finalOneSidedHedgeSeconds (e.g. 30s) before window end only: if still strictly
+ *   one-sided, FOK buy opposite at ask to match qty; pair-cost/settlement bypassed (survival hedge).
  */
 
 import type { ClobClient } from '@polymarket/clob-client';
-import type { StrategyConfig, ActiveMarket, WindowState } from '../interfaces/strategyInterfaces';
+import type { StrategyConfig, ActiveMarket, WindowState, OrderBookSnapshot } from '../interfaces/strategyInterfaces';
 import { getActiveBtcUpDownMarket, secondsUntilWindowEnd, getLastScanReport } from './marketDiscovery';
 import {
     effectiveWarmupSeconds,
@@ -20,6 +22,7 @@ import {
     createEmptyWindowState,
     updateWindowStateFromFill,
     clampBuySizeForSimulatedGates,
+    buildFinalOneSidedHedgeDecision,
 } from './hedgeStrategy';
 import {
     getBothOrderBooks,
@@ -66,6 +69,7 @@ export interface HedgeBotOptions {
 
 const MARKET_CACHE_TTL_MS = 30_000;
 const REDEEM_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+/** No normal trading in the last N seconds (balanced windows wait for resolution). */
 const HARD_CUTOFF_SECONDS = 15;
 const MAX_PENDING_ORDER_AGE_MS = 12_000;
 
@@ -276,13 +280,17 @@ export class HedgeBot {
     }
 
     private chooseClipSize(currentBid: number, secondsLeft: number, windowSec: number): number {
+        const bal = this.config.liveTrading
+            ? this.cachedBalances.polymarketUsdc
+            : getSimulatedBalance();
         return referencePickClipSize(
             this.windowState!,
             currentBid,
             secondsLeft,
             windowSec,
             this.config,
-            this.getSizeLadder()
+            this.getSizeLadder(),
+            { availableBalanceUsd: bal }
         );
     }
 
@@ -411,6 +419,7 @@ export class HedgeBot {
         const totalBalanceUsdc = this.config.liveTrading
             ? this.cachedBalances.totalUsdc
             : getSimulatedBalance();
+        const titleQ = (this.cachedMarket?.question || scan?.activeMarket?.question || '').trim();
         return {
             walletBalanceUsdc: this.config.liveTrading ? this.cachedBalances.publicWalletUsdc : 0,
             polymarketBalanceUsdc: balanceUsdc,
@@ -418,6 +427,8 @@ export class HedgeBot {
             walletAddress: ENV.PUBLIC_ADDRESS,
             proxyWalletAddress: ENV.PROXY_WALLET,
             liveTrading: this.config.liveTrading,
+            activeMarketTitle: titleQ || null,
+            tradingWindowMinutes: this.config.btcMarketWindowMinutes,
             completedWindows: this.completedWindows.length,
             cumulativeProfitUsd: totalPL,
             uptimeSeconds: Math.floor((Date.now() - this.startedAt) / 1000),
@@ -492,6 +503,229 @@ export class HedgeBot {
             sessionPnlUsd: portfolioValueUsd - baseline,
             sessionStartPortfolioUsd: baseline,
         };
+    }
+
+    /**
+     * Last N seconds: if we only hold Up or only Down, buy the opposite at the ask (FOK) to match
+     * share counts so After PnL If Up and After PnL If Down are equal (stable). Skips normal strategy.
+     */
+    private async tryExecuteFinalOneSidedHedge(
+        market: ActiveMarket,
+        state: WindowState,
+        secondsLeft: number,
+        q: boolean
+    ): Promise<boolean> {
+        const absCut = this.config.absoluteNoOrderSeconds ?? 2;
+        const finalSec = this.config.finalOneSidedHedgeSeconds ?? 30;
+        if (secondsLeft <= absCut || secondsLeft > finalSec) return false;
+
+        const z = 1e-8;
+        const oneSided =
+            (state.qtyYes > z && state.qtyNo <= z) || (state.qtyNo > z && state.qtyYes <= z);
+        if (!oneSided || state.totalSpentUsd <= 0) return false;
+
+        let bookYes: OrderBookSnapshot;
+        let bookNo: OrderBookSnapshot;
+        try {
+            const books = await getBothOrderBooks(this.client, market);
+            bookYes = books.bookYes;
+            bookNo = books.bookNo;
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            updateDashboardState({
+                ...this.getDashboardExtras(),
+                marketSlug: market.slug,
+                windowEndIso: market.endDateIso,
+                pairCost: state.pairCost,
+                qtyYes: state.qtyYes,
+                qtyNo: state.qtyNo,
+                lockedProfit: state.lockedProfit,
+                totalSpentUsd: state.totalSpentUsd,
+                consecutiveFailures: this.riskState.consecutiveOrderFailures,
+                pendingOrders: this.activePendingOrder ? 1 : 0,
+                lastTick: new Date().toISOString(),
+                message: `FINAL HEDGE: orderbook error — ${msg}`,
+            });
+            return true;
+        }
+
+        this.liveBestBidYes = bookYes.bestBid ?? 0;
+        this.liveBestBidNo = bookNo.bestBid ?? 0;
+        this.liveBestAskYes = bookYes.bestAsk ?? 0;
+        this.liveBestAskNo = bookNo.bestAsk ?? 0;
+        this.liveCombinedBid = this.liveBestBidYes + this.liveBestBidNo;
+        this.liveCombinedAsk = this.liveBestAskYes + this.liveBestAskNo;
+
+        const d = buildFinalOneSidedHedgeDecision(this.config, state, bookYes, bookNo, secondsLeft);
+        if (d === null) return false;
+
+        if (d.action === 'HOLD') {
+            this.holdsThisWindow++;
+            updateDashboardState({
+                ...this.getDashboardExtras(),
+                marketSlug: market.slug,
+                windowEndIso: market.endDateIso,
+                pairCost: state.pairCost,
+                qtyYes: state.qtyYes,
+                qtyNo: state.qtyNo,
+                lockedProfit: state.lockedProfit,
+                totalSpentUsd: state.totalSpentUsd,
+                consecutiveFailures: this.riskState.consecutiveOrderFailures,
+                pendingOrders: 0,
+                lastTick: new Date().toISOString(),
+                message: `FINAL HEDGE: ${d.reason}`,
+            });
+            return true;
+        }
+
+        const side = d.action === 'BUY_YES' ? 'YES' as const : 'NO' as const;
+        const sideLabel = side === 'YES' ? 'Up' : 'Down';
+        const ts = this.config.tickSize || 0.01;
+        const limitPx = Math.min(0.99, Math.round((d.price + ts) * 100) / 100);
+        const orderCost = limitPx * d.size;
+
+        if (orderCost < 1.0) {
+            this.holdsThisWindow++;
+            updateDashboardState({
+                ...this.getDashboardExtras(),
+                marketSlug: market.slug,
+                windowEndIso: market.endDateIso,
+                pairCost: state.pairCost,
+                qtyYes: state.qtyYes,
+                qtyNo: state.qtyNo,
+                lockedProfit: state.lockedProfit,
+                totalSpentUsd: state.totalSpentUsd,
+                consecutiveFailures: this.riskState.consecutiveOrderFailures,
+                pendingOrders: 0,
+                lastTick: new Date().toISOString(),
+                message: `FINAL HEDGE: order $${orderCost.toFixed(2)} < $1 CLOB min`,
+            });
+            return true;
+        }
+
+        if (this.cachedBalances.polymarketUsdc < orderCost + 0.25) {
+            this.holdsThisWindow++;
+            updateDashboardState({
+                ...this.getDashboardExtras(),
+                marketSlug: market.slug,
+                windowEndIso: market.endDateIso,
+                pairCost: state.pairCost,
+                qtyYes: state.qtyYes,
+                qtyNo: state.qtyNo,
+                lockedProfit: state.lockedProfit,
+                totalSpentUsd: state.totalSpentUsd,
+                consecutiveFailures: this.riskState.consecutiveOrderFailures,
+                pendingOrders: 0,
+                lastTick: new Date().toISOString(),
+                message: `FINAL HEDGE: insufficient balance for $${orderCost.toFixed(2)}`,
+            });
+            return true;
+        }
+
+        const maxOrder = this.config.maxSingleOrderUsd ?? 15;
+        if (orderCost > maxOrder) {
+            this.holdsThisWindow++;
+            updateDashboardState({
+                ...this.getDashboardExtras(),
+                marketSlug: market.slug,
+                windowEndIso: market.endDateIso,
+                pairCost: state.pairCost,
+                qtyYes: state.qtyYes,
+                qtyNo: state.qtyNo,
+                lockedProfit: state.lockedProfit,
+                totalSpentUsd: state.totalSpentUsd,
+                consecutiveFailures: this.riskState.consecutiveOrderFailures,
+                pendingOrders: 0,
+                lastTick: new Date().toISOString(),
+                message: `FINAL HEDGE: order $${orderCost.toFixed(2)} > cap $${maxOrder.toFixed(2)}`,
+            });
+            return true;
+        }
+
+        const riskCheck = canPlaceOrder(this.config, this.riskState, state, orderCost);
+        if (!riskCheck.allowed) {
+            this.holdsThisWindow++;
+            updateDashboardState({
+                ...this.getDashboardExtras(),
+                marketSlug: market.slug,
+                windowEndIso: market.endDateIso,
+                pairCost: state.pairCost,
+                qtyYes: state.qtyYes,
+                qtyNo: state.qtyNo,
+                lockedProfit: state.lockedProfit,
+                totalSpentUsd: state.totalSpentUsd,
+                consecutiveFailures: this.riskState.consecutiveOrderFailures,
+                pendingOrders: 0,
+                lastTick: new Date().toISOString(),
+                message: `FINAL HEDGE: ${riskCheck.reason}`,
+            });
+            return true;
+        }
+
+        const roundNum = this.roundsThisWindow + 1;
+        const tokenId = side === 'YES' ? market.yesTokenId : market.noTokenId;
+        qlog(
+            q,
+            `[Final hedge #${roundNum}] ${sideLabel} ${d.size}sh @ ask ~$${d.price.toFixed(2)} ($${orderCost.toFixed(2)}) | ${secondsLeft}s left`
+        );
+
+        if (this.config.liveTrading) {
+            const result = await buyInstant(this.client, tokenId, d.price, d.size, this.config, !!market.negRisk);
+            if (result.success && result.orderId && result.orderId !== 'unknown') {
+                this.activePendingOrder = createPendingOrder(result.orderId, tokenId, side, limitPx, d.size);
+                this.riskState = resetCircuitBreaker(this.riskState);
+                logWindowState(state, 'order_placed',
+                    `Final hedge: ${sideLabel} ${d.size}@~$${limitPx.toFixed(2)} FOK(ask) | ${secondsLeft}s left`,
+                    { feeBipsAssumption: this.config.feeBips, quietConsole: q, ...this.getAccountingSnapshot(state) }
+                );
+                this.lastBalanceFetchTs = 0;
+                this.lastPositionFetchTs = 0;
+            } else {
+                this.riskState = recordOrderFailure(this.riskState);
+                console.error(`[Bot] Final hedge ${sideLabel} failed: ${result.error}`);
+            }
+        } else {
+            this.windowState = updateWindowStateFromFill(state, side, d.size, orderCost);
+            this.riskState = recordOrderSuccess(this.riskState, orderCost);
+            this.lastBuyPrice = limitPx;
+            this.lastExecutedSide = side;
+            this.roundsThisWindow++;
+
+            recordPaperOrder({
+                windowSlug: market.slug,
+                windowEndIso: market.endDateIso,
+                side,
+                price: limitPx,
+                size: d.size,
+                costUsd: orderCost,
+                roundInWindow: this.roundsThisWindow,
+            });
+
+            logWindowState(this.windowState, 'tick',
+                `[PAPER] Final hedge: ${sideLabel} ${d.size}@$${limitPx.toFixed(4)} | ` +
+                `pairCost=$${this.windowState.pairCost.toFixed(4)} | Up=${this.windowState.qtyYes} Down=${this.windowState.qtyNo}`,
+                { feeBipsAssumption: this.config.feeBips, quietConsole: q, ...this.getAccountingSnapshot(this.windowState) }
+            );
+        }
+
+        const wsOut = !this.config.liveTrading ? this.windowState! : state;
+        updateDashboardState({
+            ...this.getDashboardExtras(),
+            marketSlug: market.slug,
+            windowEndIso: market.endDateIso,
+            pairCost: wsOut.pairCost,
+            qtyYes: wsOut.qtyYes,
+            qtyNo: wsOut.qtyNo,
+            lockedProfit: wsOut.lockedProfit,
+            totalSpentUsd: wsOut.totalSpentUsd,
+            consecutiveFailures: this.riskState.consecutiveOrderFailures,
+            pendingOrders: this.activePendingOrder ? 1 : 0,
+            lastTick: new Date().toISOString(),
+            message: `Final hedge: ${sideLabel} ${d.size}@ask ~$${d.price.toFixed(2)} | ` +
+                `Up=${wsOut.qtyYes} Down=${wsOut.qtyNo} | ${secondsLeft}s left`,
+        });
+        this.options.onStateChange?.(wsOut, this.riskState);
+        return true;
     }
 
     // ─── Tick wrapper ────────────────────────────────────────────────────
@@ -658,8 +892,26 @@ export class HedgeBot {
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // ██  PHASE 3: Stop conditions                                    ██
+        // ██  PHASE 3: Stop conditions + final one-sided hedge            ██
         // ══════════════════════════════════════════════════════════════════
+
+        const absOrderCut = this.config.absoluteNoOrderSeconds ?? 2;
+        if (secondsLeft <= absOrderCut) {
+            updateDashboardState({
+                ...this.getDashboardExtras(),
+                marketSlug: market.slug, windowEndIso: market.endDateIso,
+                pairCost: state.pairCost, qtyYes: state.qtyYes, qtyNo: state.qtyNo,
+                lockedProfit: state.lockedProfit, totalSpentUsd: state.totalSpentUsd,
+                consecutiveFailures: this.riskState.consecutiveOrderFailures,
+                pendingOrders: 0,
+                lastTick: new Date().toISOString(),
+                message: `CUTOFF: ${secondsLeft}s left — no orders (absolute end buffer)`,
+            });
+            return;
+        }
+
+        const finalHedgeHandled = await this.tryExecuteFinalOneSidedHedge(market, state, secondsLeft, q);
+        if (finalHedgeHandled) return;
 
         if (secondsLeft <= HARD_CUTOFF_SECONDS) {
             updateDashboardState({

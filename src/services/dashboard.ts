@@ -96,6 +96,10 @@ export interface DashboardState {
     afterPnlIfUpUsd: number;
     /** Net P/L if Down (NO) wins: qtyNo×$1 − total spent (gross; fees not deducted). */
     afterPnlIfDownUsd: number;
+    /** Polymarket market question (e.g. Bitcoin Up or Down — … time range ET). */
+    activeMarketTitle: string | null;
+    /** Configured window length for ET fallback label (5 or 15). */
+    tradingWindowMinutes: 5 | 15 | null;
 }
 
 let sharedState: DashboardState = {
@@ -160,6 +164,8 @@ let sharedState: DashboardState = {
     sessionStartPortfolioUsd: 0,
     afterPnlIfUpUsd: 0,
     afterPnlIfDownUsd: 0,
+    activeMarketTitle: null,
+    tradingWindowMinutes: null,
 };
 
 export function updateDashboardState(update: Partial<DashboardState>): void {
@@ -188,6 +194,40 @@ function formatUptime(seconds: number): string {
 function shortAddr(addr: string): string {
     if (!addr || addr.length < 12) return addr || '—';
     return addr.slice(0, 6) + '...' + addr.slice(-4);
+}
+
+function escapeHtml(str: string): string {
+    return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+/** Prominent market line for top of dashboard (API question or ET window from window end). */
+function marketHeadlineHtml(s: DashboardState): string {
+    const raw = (s.activeMarketTitle || s.scanActiveMarket?.question || '').trim();
+    if (raw) return escapeHtml(raw);
+    if (s.windowEndIso) {
+        const endMs = new Date(s.windowEndIso).getTime();
+        const mins = s.tradingWindowMinutes === 5 ? 5 : s.tradingWindowMinutes === 15 ? 15 : 5;
+        const startMs = endMs - mins * 60 * 1000;
+        const opts: Intl.DateTimeFormatOptions = {
+            timeZone: 'America/New_York',
+            weekday: 'long',
+            month: 'long',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+        };
+        const startStr = new Date(startMs).toLocaleString('en-US', opts);
+        const endStr = new Date(endMs).toLocaleString('en-US', {
+            ...opts,
+            timeZoneName: 'short',
+        });
+        return escapeHtml(`Bitcoin Up or Down — ${startStr} – ${endStr}`);
+    }
+    return '<span style="opacity:0.75;color:var(--text-muted)">Waiting for active BTC Up/Down market…</span>';
 }
 
 function serveHtml(): string {
@@ -410,10 +450,33 @@ function serveHtml(): string {
     .tag-reject { background: rgba(239,68,68,0.15); color: #f87171; padding: 2px 8px; border-radius: 10px; font-size: 0.68rem; font-weight: 600; }
     .scan-empty { text-align: center; padding: 20px; color: var(--text-muted); font-size: 0.82rem; }
 
+    /* ─── Top strip (emergency stop + market title) ─── */
+    .top-strip {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      margin-bottom: 22px;
+    }
+    .top-market-title {
+      font-size: 1.06rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      line-height: 1.5;
+      text-align: center;
+      padding: 16px 20px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+    }
+
     /* ─── Controls ─── */
     .controls {
       display: flex; align-items: center; gap: 12px;
       margin-bottom: 24px; flex-wrap: wrap;
+    }
+    .controls.controls-at-top {
+      justify-content: center;
+      margin-bottom: 0;
     }
     .btn {
       display: inline-flex; align-items: center; gap: 8px;
@@ -439,6 +502,20 @@ function serveHtml(): string {
 </head>
 <body>
   <div class="app">
+
+    <!-- Emergency stop + market window (top) -->
+    <div class="top-strip">
+      <div class="controls controls-at-top">
+        <form method="post" action="/killSwitch" style="display:inline">
+          <input type="hidden" name="on" value="${s.killSwitch ? '0' : '1'}" />
+          <button type="submit" class="btn ${s.killSwitch ? 'btn-success' : 'btn-danger'}">
+            ${s.killSwitch ? 'Resume Trading' : 'Emergency Stop'}
+          </button>
+        </form>
+        <span class="btn-hint">Stops new orders without shutting down the bot. Ctrl+C to fully stop.</span>
+      </div>
+      <div class="top-market-title">${marketHeadlineHtml(s)}</div>
+    </div>
 
     <!-- Header -->
     <div class="header">
@@ -1086,17 +1163,6 @@ function serveHtml(): string {
         </table>
       </div>
       ` : ''}
-    </div>
-
-    <!-- Controls -->
-    <div class="controls">
-      <form method="post" action="/killSwitch" style="display:inline">
-        <input type="hidden" name="on" value="${s.killSwitch ? '0' : '1'}" />
-        <button type="submit" class="btn ${s.killSwitch ? 'btn-success' : 'btn-danger'}">
-          ${s.killSwitch ? 'Resume Trading' : 'Emergency Stop'}
-        </button>
-      </form>
-      <span class="btn-hint">Stops new orders without shutting down the bot. Ctrl+C to fully stop.</span>
     </div>
 
     <!-- Footer -->

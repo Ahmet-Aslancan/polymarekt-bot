@@ -31,7 +31,7 @@ import {
 } from '../services/riskManager';
 import { logWindowState } from '../services/strategyLogger';
 import { updateDashboardState, getDashboardState } from '../services/dashboard';
-import { initSimulatedBalance, recordOrder } from '../services/tradeHistory';
+import { getSimulatedBalance, initSimulatedBalance, recordOrder } from '../services/tradeHistory';
 import type { StrategyConfig, WindowState } from '../interfaces/strategyInterfaces';
 import { btcWindowDurationSec } from '../services/marketDiscovery';
 
@@ -167,6 +167,7 @@ class DemoBot {
             roundsThisWindow: this.demoRoundsThisWindow,
             lastExecutedSide: this.demoLastSide,
             secondsLeft: secsLeft,
+            availableBalanceUsd: getSimulatedBalance(),
         });
         const additionalSpend = decision.action !== 'HOLD' ? decision.price * decision.size : 0;
         const riskCheck = canPlaceOrder(this.config, this.riskState, this.windowState, additionalSpend);

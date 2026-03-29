@@ -80,14 +80,31 @@ export function referencePickClipSize(
     secondsLeft: number,
     windowSec: number,
     config: StrategyConfig,
-    ladder: number[]
+    ladder: number[],
+    opts?: { availableBalanceUsd?: number }
 ): number {
     const maxClip = Math.max(1, Math.floor(config.maxClipShares ?? 54));
     const remainingBudget = Math.max(0, config.maxPositionPerWindowUsd - state.totalSpentUsd);
     const maxByBudget = currentBid > 0 ? Math.floor(remainingBudget / currentBid) : 0;
-    const maxBySingleOrder = currentBid > 0 && config.maxSingleOrderUsd
-        ? Math.floor(config.maxSingleOrderUsd / currentBid)
-        : maxClip;
+
+    let shareCapFromUsd: number | null = null;
+    if (currentBid > 0 && config.maxSingleOrderUsd != null && config.maxSingleOrderUsd > 0) {
+        shareCapFromUsd = Math.floor(config.maxSingleOrderUsd / currentBid);
+    }
+    const bal = opts?.availableBalanceUsd;
+    const frac = config.orderSpendBalanceFraction;
+    if (
+        currentBid > 0 &&
+        bal != null &&
+        bal > 0 &&
+        frac != null &&
+        frac > 0
+    ) {
+        const fromBal = Math.floor((bal * frac) / currentBid);
+        shareCapFromUsd = shareCapFromUsd != null ? Math.min(shareCapFromUsd, fromBal) : fromBal;
+    }
+    const maxBySingleOrder = shareCapFromUsd != null ? shareCapFromUsd : maxClip;
+
     const hardCap = Math.max(0, Math.min(maxClip, maxByBudget, maxBySingleOrder));
     if (hardCap <= 0) return 0;
 
