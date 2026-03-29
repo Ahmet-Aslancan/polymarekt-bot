@@ -130,6 +130,59 @@ export function updateWindowStateFromSell(
     return newState;
 }
 
+const SETTLEMENT_PNL_EPS = 1e-6;
+
+/**
+ * After a fill, dashboard "After PnL If Up/Down" are qtyYes/No − totalSpentUsd.
+ * When only one leg is held (first leg of a two-leg step), we do not enforce this gate.
+ * Once both legs are non-zero, require both settlement P/L ≥ 0 so each outcome covers total spend.
+ */
+export function violatesDualLegSettlementGate(s: WindowState): boolean {
+    if (s.qtyYes <= 0 || s.qtyNo <= 0) return false;
+    return (
+        s.qtyYes + SETTLEMENT_PNL_EPS < s.totalSpentUsd ||
+        s.qtyNo + SETTLEMENT_PNL_EPS < s.totalSpentUsd
+    );
+}
+
+/**
+ * Largest integer size in [minSize, initialSize] that passes simulated pair-cost ceiling
+ * (when both sides > 0 after fill) and dual-leg settlement (when both sides > 0).
+ * Skips settlement + strict pair-cost checks while still one-sided (first leg only).
+ */
+export function clampBuySizeForSimulatedGates(
+    state: WindowState,
+    side: 'YES' | 'NO',
+    price: number,
+    initialSize: number,
+    config: StrategyConfig
+): number {
+    const minSize = Math.max(1, Math.floor(config.orderMinSize || 1));
+    const pairCostCeiling = Math.min(config.safetyMargin, config.targetPairCostMax);
+    const CLOB_MIN_ORDER_USD = 1.0;
+    let s = Math.floor(initialSize);
+    while (s >= minSize) {
+        if (price * s < CLOB_MIN_ORDER_USD) {
+            s--;
+            continue;
+        }
+        const addedCost = s * price;
+        const newState = updateWindowStateFromFill(state, side, s, addedCost);
+        const both = newState.qtyYes > 0 && newState.qtyNo > 0;
+        if (!both) return s;
+        if (newState.pairCost > pairCostCeiling || newState.pairCost >= 1.0) {
+            s--;
+            continue;
+        }
+        if (violatesDualLegSettlementGate(newState)) {
+            s--;
+            continue;
+        }
+        return s;
+    }
+    return 0;
+}
+
 /** Simulate state after buying deltaQty at price on side */
 function simulateState(
     state: WindowState,
@@ -161,7 +214,6 @@ export function decide(
     ctx?: StrategyDecisionContext
 ): StrategyDecision {
     const tickSize = config.tickSize || 0.01;
-    const pairCostCeiling = Math.min(config.safetyMargin, config.targetPairCostMax);
     const CLOB_MIN_ORDER_USD = 1.0;
 
     const bestBidYes = bookYes.bids && bookYes.bids.length > 0 ? bookYes.bids[0] : undefined;
@@ -243,21 +295,18 @@ export function decide(
         size = Math.min(size, diff);
     }
 
+    size = clampBuySizeForSimulatedGates(state, side, price, size, config);
+
     if (size <= 0 || price * size < CLOB_MIN_ORDER_USD) {
         return {
             action: 'HOLD', tokenId: '', price: 0, size: 0,
-            reason: `Clip size ${size} @ $${price.toFixed(4)} below CLOB $1`,
+            reason: size <= 0
+                ? 'No clip size satisfies pair cost and dual-leg settlement (both After PnL ≥ 0 once hedged)'
+                : `Clip size ${size} @ $${price.toFixed(4)} below CLOB $1`,
         };
     }
 
     const { newPairCost, newState } = simulateState(state, side, size, price);
-    const wouldHaveBothSides = newState.qtyYes > 0 && newState.qtyNo > 0;
-    if (wouldHaveBothSides && (newPairCost > pairCostCeiling || newPairCost >= 1.0)) {
-        return {
-            action: 'HOLD', tokenId: '', price: 0, size: 0,
-            reason: `Simulated pairCost=${newPairCost.toFixed(4)} exceeds limit`,
-        };
-    }
 
     return {
         action: side === 'YES' ? 'BUY_YES' : 'BUY_NO',

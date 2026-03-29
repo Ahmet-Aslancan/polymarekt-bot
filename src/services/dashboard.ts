@@ -13,6 +13,7 @@ import {
     getSimulatedBalance,
     getCompletedWindowsDetail,
     getLast24hSummary,
+    getOrdersForWindow,
 } from './tradeHistory';
 
 const DEFAULT_PORT = 3750;
@@ -91,6 +92,10 @@ export interface DashboardState {
     portfolioValueUsd: number;
     sessionPnlUsd: number;
     sessionStartPortfolioUsd: number;
+    /** Net P/L if Up (YES) wins: qtyYes×$1 − total spent (gross; fees not deducted). */
+    afterPnlIfUpUsd: number;
+    /** Net P/L if Down (NO) wins: qtyNo×$1 − total spent (gross; fees not deducted). */
+    afterPnlIfDownUsd: number;
 }
 
 let sharedState: DashboardState = {
@@ -153,6 +158,8 @@ let sharedState: DashboardState = {
     portfolioValueUsd: 0,
     sessionPnlUsd: 0,
     sessionStartPortfolioUsd: 0,
+    afterPnlIfUpUsd: 0,
+    afterPnlIfDownUsd: 0,
 };
 
 export function updateDashboardState(update: Partial<DashboardState>): void {
@@ -160,7 +167,13 @@ export function updateDashboardState(update: Partial<DashboardState>): void {
 }
 
 export function getDashboardState(): DashboardState {
-    return { ...sharedState };
+    const s = { ...sharedState };
+    const spent = s.totalSpentUsd;
+    return {
+        ...s,
+        afterPnlIfUpUsd: s.qtyYes - spent,
+        afterPnlIfDownUsd: s.qtyNo - spent,
+    };
 }
 
 function formatUptime(seconds: number): string {
@@ -178,7 +191,7 @@ function shortAddr(addr: string): string {
 }
 
 function serveHtml(): string {
-    const s = sharedState;
+    const s = getDashboardState();
     const statusColor = s.running ? '#10b981' : '#ef4444';
     const statusGlow = s.running ? 'rgba(16,185,129,0.3)' : 'rgba(239,68,68,0.3)';
     const modeColor = s.liveTrading ? '#f59e0b' : '#6366f1';
@@ -584,6 +597,22 @@ function serveHtml(): string {
         <div class="sub">Actual wallet: ${s.actualQtyYes.toFixed(1)} / ${s.actualQtyNo.toFixed(1)}</div>
         <div class="sub">spent $${s.totalSpentUsd.toFixed(2)} / $${s.maxPositionPerWindowUsd.toFixed(0)}</div>
       </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-top:14px;">
+      <div class="card" style="border-color:rgba(59,130,246,0.35);">
+        <div class="label">After PnL If Up</div>
+        <div class="value" style="color:${s.afterPnlIfUpUsd >= 0 ? '#10b981' : '#ef4444'};">
+          ${s.afterPnlIfUpUsd >= 0 ? '+' : ''}$${s.afterPnlIfUpUsd.toFixed(2)}
+        </div>
+        <div class="sub">If YES wins: $${s.qtyYes.toFixed(0)} payout &minus; $${s.totalSpentUsd.toFixed(2)} spent</div>
+      </div>
+      <div class="card" style="border-color:rgba(139,92,246,0.35);">
+        <div class="label">After PnL If Down</div>
+        <div class="value" style="color:${s.afterPnlIfDownUsd >= 0 ? '#10b981' : '#ef4444'};">
+          ${s.afterPnlIfDownUsd >= 0 ? '+' : ''}$${s.afterPnlIfDownUsd.toFixed(2)}
+        </div>
+        <div class="sub">If NO wins: $${s.qtyNo.toFixed(0)} payout &minus; $${s.totalSpentUsd.toFixed(2)} spent</div>
+      </div>
     </div>`;
     })()}
 
@@ -732,6 +761,63 @@ function serveHtml(): string {
       </div>
     </div>`;
     })() : ''}
+
+    ${(() => {
+        if (!s.windowEndIso) return '';
+        const windowOrders = getOrdersForWindow(s.windowEndIso)
+            .slice()
+            .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+        if (windowOrders.length === 0) return '';
+        let runY = 0;
+        let runN = 0;
+        let runSpent = 0;
+        let rows = '';
+        for (let i = 0; i < windowOrders.length; i++) {
+            const o = windowOrders[i];
+            runSpent += o.costUsd;
+            if (o.side === 'YES') runY += o.size;
+            else runN += o.size;
+            const pUp = runY - runSpent;
+            const pDown = runN - runSpent;
+            const cUp = pUp >= 0 ? '#10b981' : '#ef4444';
+            const cDown = pDown >= 0 ? '#10b981' : '#ef4444';
+            rows += '<tr style="border-bottom:1px solid rgba(42,48,80,0.5);">' +
+                '<td style="padding:8px 10px;">' + (i + 1) + '</td>' +
+                '<td style="padding:8px 10px;">' + new Date(o.timestamp).toLocaleTimeString() + '</td>' +
+                '<td style="padding:8px 10px;">' + o.sideLabel + '</td>' +
+                '<td style="padding:8px 10px;font-family:\'JetBrains Mono\',monospace;">' + o.size + '</td>' +
+                '<td style="padding:8px 10px;font-family:\'JetBrains Mono\',monospace;">$' + o.price.toFixed(4) + '</td>' +
+                '<td style="padding:8px 10px;font-family:\'JetBrains Mono\',monospace;">$' + o.costUsd.toFixed(2) + '</td>' +
+                '<td style="padding:8px 10px;font-weight:600;color:' + cUp + ';font-family:\'JetBrains Mono\',monospace;">' +
+                (pUp >= 0 ? '+' : '') + '$' + pUp.toFixed(2) + '</td>' +
+                '<td style="padding:8px 10px;font-weight:600;color:' + cDown + ';font-family:\'JetBrains Mono\',monospace;">' +
+                (pDown >= 0 ? '+' : '') + '$' + pDown.toFixed(2) + '</td>' +
+                '</tr>';
+        }
+        return `
+    <div class="section-title">After each purchase &mdash; settlement P/L</div>
+    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:24px;">
+      <div style="font-size:0.72rem;color:var(--text-muted);margin-bottom:12px;">
+        Running totals after each recorded fill (paper session). <strong>After PnL If Up</strong> = cumulative Up shares &times; $1 &minus; cumulative spend;
+        <strong>After PnL If Down</strong> = cumulative Down shares &times; $1 &minus; cumulative spend. Fees not included.
+      </div>
+      <div style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:0.78rem;min-width:640px;">
+        <thead><tr style="text-align:left;border-bottom:1px solid var(--border);">
+          <th style="padding:8px 10px;">#</th>
+          <th style="padding:8px 10px;">Time</th>
+          <th style="padding:8px 10px;">Side</th>
+          <th style="padding:8px 10px;">Size</th>
+          <th style="padding:8px 10px;">Price</th>
+          <th style="padding:8px 10px;">Cost</th>
+          <th style="padding:8px 10px;">After PnL If Up</th>
+          <th style="padding:8px 10px;">After PnL If Down</th>
+        </tr></thead>
+        <tbody>` + rows + `</tbody>
+      </table>
+      </div>
+    </div>`;
+    })()}
 
     <!-- Session & Risk -->
     <div class="section-title">Session &amp; Risk</div>

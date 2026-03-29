@@ -3,6 +3,8 @@
  * - 5m or 15m via strategy.config.json → btcMarketWindowMinutes
  * - Maker bids; tilt + share-parity side pick;
  * - Forced leg switch every N orders; warmup then mid-window-heavy clips (duration-scaled)
+ * - Once both YES and NO are held, clip size is clamped so pair cost and dual-leg settlement
+ *   (After PnL If Up/Down ≥ 0) pass; first leg only is not subject to the settlement gate.
  */
 
 import type { ClobClient } from '@polymarket/clob-client';
@@ -14,7 +16,11 @@ import {
     referencePickBuySide,
     referencePickClipSize,
 } from './referencePairStrategy';
-import { createEmptyWindowState, updateWindowStateFromFill } from './hedgeStrategy';
+import {
+    createEmptyWindowState,
+    updateWindowStateFromFill,
+    clampBuySizeForSimulatedGates,
+} from './hedgeStrategy';
 import {
     getBothOrderBooks,
     placeLimitBuyOrder,
@@ -749,6 +755,21 @@ export class HedgeBot {
         const diff = Math.abs(state.qtyYes - state.qtyNo);
         if (secondsLeft <= this.config.stopTradingSecondsBeforeEnd && diff > 0) {
             shares = Math.min(shares, diff);
+        }
+
+        shares = clampBuySizeForSimulatedGates(state, side, currentBid, shares, this.config);
+        if (shares <= 0) {
+            this.holdsThisWindow++;
+            updateDashboardState({
+                ...this.getDashboardExtras(),
+                marketSlug: market.slug, windowEndIso: market.endDateIso,
+                pairCost: state.pairCost, qtyYes: state.qtyYes, qtyNo: state.qtyNo,
+                lockedProfit: state.lockedProfit, totalSpentUsd: state.totalSpentUsd,
+                consecutiveFailures: this.riskState.consecutiveOrderFailures,
+                pendingOrders: 0, lastTick: new Date().toISOString(),
+                message: 'HOLD: no clip satisfies pair cost + dual-leg settlement (both After PnL ≥ 0 once hedged)',
+            });
+            return;
         }
 
         // ══════════════════════════════════════════════════════════════════

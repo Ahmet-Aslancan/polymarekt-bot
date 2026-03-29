@@ -31,6 +31,7 @@ import {
 } from '../services/riskManager';
 import { logWindowState } from '../services/strategyLogger';
 import { updateDashboardState, getDashboardState } from '../services/dashboard';
+import { initSimulatedBalance, recordOrder } from '../services/tradeHistory';
 import type { StrategyConfig, WindowState } from '../interfaces/strategyInterfaces';
 import { btcWindowDurationSec } from '../services/marketDiscovery';
 
@@ -195,6 +196,16 @@ class DemoBot {
         this.demoRoundsThisWindow++;
         this.demoLastSide = side;
 
+        recordOrder({
+            windowSlug: this.currentWindow.slug,
+            windowEndIso: this.currentWindow.endDateIso,
+            side,
+            price: decision.price,
+            size: decision.size,
+            costUsd: fillCost,
+            roundInWindow: this.demoRoundsThisWindow,
+        });
+
         logWindowState(this.windowState, 'tick',
             `[DEMO] ${side} ${decision.size} @ ${decision.price.toFixed(4)} | pairCost=${this.windowState.pairCost.toFixed(4)}`,
             { feeBipsAssumption: this.config.feeBips }
@@ -219,6 +230,7 @@ class DemoBot {
 
     start(): void {
         if (this.intervalId) return;
+        initSimulatedBalance(this.config.paperStartingBalanceUsd ?? 5000);
         updateDashboardState({ running: true, message: 'Demo bot starting...' });
         console.log(`[DemoBot] Started. Poll: ${this.config.pollIntervalMs}ms. Dashboard: http://localhost:3750`);
         console.log('[DemoBot] Using simulated orderbooks (no wallet/API needed)\n');
