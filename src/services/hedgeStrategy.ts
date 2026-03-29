@@ -44,71 +44,13 @@ export function createEmptyWindowState(marketSlug: string, conditionId: string, 
     };
 }
 
-export function updateWindowStateFromFill(
-    state: WindowState,
-    side: 'YES' | 'NO',
-    addedQty: number,
-    addedCost: number
-): WindowState {
-    const newState = { ...state };
-    if (side === 'YES') {
-        newState.qtyYes = state.qtyYes + addedQty;
-        newState.costYes = state.costYes + addedCost;
-        newState.avgYes = newState.qtyYes > 0 ? newState.costYes / newState.qtyYes : 0;
-    } else {
-        newState.qtyNo = state.qtyNo + addedQty;
-        newState.costNo = state.costNo + addedCost;
-        newState.avgNo = newState.qtyNo > 0 ? newState.costNo / newState.qtyNo : 0;
-    }
-    // Pair cost is only meaningful when we have shares on both sides
-    if (newState.qtyYes > 0 && newState.qtyNo > 0) {
-        newState.pairCost = newState.avgYes + newState.avgNo;
-    } else if (newState.qtyYes > 0) {
-        newState.pairCost = newState.avgYes; // partial — only one side so far
-    } else if (newState.qtyNo > 0) {
-        newState.pairCost = newState.avgNo;
-    } else {
-        newState.pairCost = 0;
-    }
-    newState.totalSpentUsd = newState.costYes + newState.costNo;
-    // Locked profit = guaranteed payout of MATCHED pairs minus their cost ONLY.
-    // Payout at resolution for matched pairs = min(Qty_YES, Qty_NO) * $1.00
-    // Cost of matched pairs = min(Qty) * avgYes + min(Qty) * avgNo
-    // Unmatched excess shares are a SEPARATE risk, not subtracted here.
-    const minQty = Math.min(newState.qtyYes, newState.qtyNo);
-    if (minQty > 0 && newState.avgYes > 0 && newState.avgNo > 0) {
-        const matchedCost = minQty * newState.avgYes + minQty * newState.avgNo;
-        newState.lockedProfit = minQty - matchedCost;
-    } else {
-        newState.lockedProfit = 0;
-    }
-    newState.lastUpdated = new Date().toISOString();
-    return newState;
-}
-
 /**
- * Update window state after SELLING shares back (emergency exit / rebalance).
- * Reduces position on the given side. Cost is reduced proportionally at average cost.
- * The difference between average cost and sale price is the realized spread loss.
+ * Recompute avg prices, pair cost, locked profit, and total spent from qty + cost.
  */
-export function updateWindowStateFromSell(
-    state: WindowState,
-    side: 'YES' | 'NO',
-    soldQty: number,
-    _saleProceeds: number
-): WindowState {
+export function recomputeWindowDerivedFields(state: WindowState): WindowState {
     const newState = { ...state };
-    if (side === 'YES') {
-        const avgCostPerShare = state.qtyYes > 0 ? state.costYes / state.qtyYes : 0;
-        newState.qtyYes = Math.max(0, state.qtyYes - soldQty);
-        newState.costYes = newState.qtyYes > 0 ? newState.qtyYes * avgCostPerShare : 0;
-        newState.avgYes = newState.qtyYes > 0 ? newState.costYes / newState.qtyYes : 0;
-    } else {
-        const avgCostPerShare = state.qtyNo > 0 ? state.costNo / state.qtyNo : 0;
-        newState.qtyNo = Math.max(0, state.qtyNo - soldQty);
-        newState.costNo = newState.qtyNo > 0 ? newState.qtyNo * avgCostPerShare : 0;
-        newState.avgNo = newState.qtyNo > 0 ? newState.costNo / newState.qtyNo : 0;
-    }
+    newState.avgYes = newState.qtyYes > 0 ? newState.costYes / newState.qtyYes : 0;
+    newState.avgNo = newState.qtyNo > 0 ? newState.costNo / newState.qtyNo : 0;
     if (newState.qtyYes > 0 && newState.qtyNo > 0) {
         newState.pairCost = newState.avgYes + newState.avgNo;
     } else if (newState.qtyYes > 0) {
@@ -128,6 +70,102 @@ export function updateWindowStateFromSell(
     }
     newState.lastUpdated = new Date().toISOString();
     return newState;
+}
+
+/** Min share delta to treat on-chain vs tracked as different (RPC + float noise). */
+export const CHAIN_QTY_SYNC_EPS = 0.05;
+
+export interface ChainSyncPriceHints {
+    bestBidYes: number;
+    bestBidNo: number;
+}
+
+/**
+ * Align window inventory with on-chain conditional token balances (source of truth in live mode).
+ * - Lower qty than tracked: scale cost proportionally (order never filled or over-counted).
+ * - Higher qty than tracked: treat extra shares as bought at best-bid hint (or prior avg, else 0.5).
+ */
+export function syncWindowStateWithChain(
+    state: WindowState,
+    chainYesRaw: number,
+    chainNoRaw: number,
+    hints: ChainSyncPriceHints
+): { state: WindowState; adjusted: boolean } {
+    const chainYes = Math.max(0, chainYesRaw);
+    const chainNo = Math.max(0, chainNoRaw);
+    const py = hints.bestBidYes > 0 ? hints.bestBidYes : (state.avgYes > 0 ? state.avgYes : 0.5);
+    const pn = hints.bestBidNo > 0 ? hints.bestBidNo : (state.avgNo > 0 ? state.avgNo : 0.5);
+
+    let adjusted = false;
+    let s = { ...state };
+
+    if (chainYes < s.qtyYes - CHAIN_QTY_SYNC_EPS) {
+        const ratio = s.qtyYes > 0 ? chainYes / s.qtyYes : 0;
+        s.qtyYes = chainYes;
+        s.costYes = s.costYes * ratio;
+        adjusted = true;
+    } else if (chainYes > s.qtyYes + CHAIN_QTY_SYNC_EPS) {
+        const d = chainYes - s.qtyYes;
+        s.qtyYes = chainYes;
+        s.costYes = s.costYes + d * py;
+        adjusted = true;
+    }
+
+    if (chainNo < s.qtyNo - CHAIN_QTY_SYNC_EPS) {
+        const ratio = s.qtyNo > 0 ? chainNo / s.qtyNo : 0;
+        s.qtyNo = chainNo;
+        s.costNo = s.costNo * ratio;
+        adjusted = true;
+    } else if (chainNo > s.qtyNo + CHAIN_QTY_SYNC_EPS) {
+        const d = chainNo - s.qtyNo;
+        s.qtyNo = chainNo;
+        s.costNo = s.costNo + d * pn;
+        adjusted = true;
+    }
+
+    s = recomputeWindowDerivedFields(s);
+    return { state: s, adjusted };
+}
+
+export function updateWindowStateFromFill(
+    state: WindowState,
+    side: 'YES' | 'NO',
+    addedQty: number,
+    addedCost: number
+): WindowState {
+    const newState = { ...state };
+    if (side === 'YES') {
+        newState.qtyYes = state.qtyYes + addedQty;
+        newState.costYes = state.costYes + addedCost;
+    } else {
+        newState.qtyNo = state.qtyNo + addedQty;
+        newState.costNo = state.costNo + addedCost;
+    }
+    return recomputeWindowDerivedFields(newState);
+}
+
+/**
+ * Update window state after SELLING shares back (emergency exit / rebalance).
+ * Reduces position on the given side. Cost is reduced proportionally at average cost.
+ * The difference between average cost and sale price is the realized spread loss.
+ */
+export function updateWindowStateFromSell(
+    state: WindowState,
+    side: 'YES' | 'NO',
+    soldQty: number,
+    _saleProceeds: number
+): WindowState {
+    const newState = { ...state };
+    if (side === 'YES') {
+        const avgCostPerShare = state.qtyYes > 0 ? state.costYes / state.qtyYes : 0;
+        newState.qtyYes = Math.max(0, state.qtyYes - soldQty);
+        newState.costYes = newState.qtyYes > 0 ? newState.qtyYes * avgCostPerShare : 0;
+    } else {
+        const avgCostPerShare = state.qtyNo > 0 ? state.costNo / state.qtyNo : 0;
+        newState.qtyNo = Math.max(0, state.qtyNo - soldQty);
+        newState.costNo = newState.qtyNo > 0 ? newState.qtyNo * avgCostPerShare : 0;
+    }
+    return recomputeWindowDerivedFields(newState);
 }
 
 const SETTLEMENT_PNL_EPS = 1e-6;

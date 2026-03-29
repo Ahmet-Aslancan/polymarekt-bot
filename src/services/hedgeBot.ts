@@ -23,6 +23,7 @@ import {
     updateWindowStateFromFill,
     clampBuySizeForSimulatedGates,
     buildFinalOneSidedHedgeDecision,
+    syncWindowStateWithChain,
 } from './hedgeStrategy';
 import {
     getBothOrderBooks,
@@ -107,6 +108,7 @@ export class HedgeBot {
     private lastPositionFetchTs = 0;
     private lastPositionKey = '';
     private cachedActualPosition = { qtyYes: 0, qtyNo: 0 };
+    /** Non-live / throttled reads; live ticks use force=true every poll. */
     private static readonly POSITION_CACHE_TTL_MS = 10_000;
 
     // ─── Live orderbook prices ───────────────────────────────────────────
@@ -181,10 +183,20 @@ export class HedgeBot {
         }
     }
 
-    private async fetchActualPosition(market: ActiveMarket): Promise<void> {
+    /**
+     * Read YES/NO share balances from chain. Use `force` in live mode every tick so strategy state
+     * matches the proxy wallet (source of truth), not only CLOB fill reconciliation.
+     */
+    private async fetchActualPosition(market: ActiveMarket, force = false): Promise<void> {
         const now = Date.now();
         const positionKey = `${market.yesTokenId}:${market.noTokenId}:${ENV.PROXY_WALLET}`;
-        if (this.lastPositionKey === positionKey && now - this.lastPositionFetchTs < HedgeBot.POSITION_CACHE_TTL_MS) return;
+        if (
+            !force &&
+            this.lastPositionKey === positionKey &&
+            now - this.lastPositionFetchTs < HedgeBot.POSITION_CACHE_TTL_MS
+        ) {
+            return;
+        }
         const MAX_RETRIES = 2;
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
@@ -203,6 +215,35 @@ export class HedgeBot {
                 }
             }
         }
+    }
+
+    /**
+     * Align `windowState` quantities (and costs) with on-chain balances. Uses last-tick orderbook
+     * bids as price hints when imputing cost for chain-only share increases.
+     */
+    private applyLiveInventorySync(market: ActiveMarket, q: boolean): void {
+        if (!this.config.liveTrading || !this.windowState) return;
+        const { state: synced, adjusted } = syncWindowStateWithChain(
+            this.windowState,
+            this.cachedActualPosition.qtyYes,
+            this.cachedActualPosition.qtyNo,
+            { bestBidYes: this.liveBestBidYes, bestBidNo: this.liveBestBidNo }
+        );
+        this.windowState = synced;
+        if (adjusted && !q) {
+            console.warn(
+                `[Bot] Inventory aligned to chain: Up=${synced.qtyYes.toFixed(2)} Down=${synced.qtyNo.toFixed(2)} ` +
+                    `(on-chain ${this.cachedActualPosition.qtyYes.toFixed(2)} / ${this.cachedActualPosition.qtyNo.toFixed(2)}) ` +
+                    `| ${market.slug}`
+            );
+        }
+    }
+
+    private async refreshLiveInventoryFromChain(market: ActiveMarket, q: boolean): Promise<void> {
+        if (!this.config.liveTrading || !this.windowState) return;
+        if (this.lastBalanceFetchTs === 0) await this.fetchBalance();
+        await this.fetchActualPosition(market, true);
+        this.applyLiveInventorySync(market, q);
     }
 
     // ─── Market cache ────────────────────────────────────────────────────
@@ -835,8 +876,18 @@ export class HedgeBot {
                     this.onOrderCompleted(this.activePendingOrder, totalFilled);
                 } catch {}
                 this.activePendingOrder = null;
-            } else {
-                // Let it rest; no new order this tick.
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // ██  PHASE 2.5: On-chain inventory (source of truth in live)     ██
+        // ══════════════════════════════════════════════════════════════════
+        await this.refreshLiveInventoryFromChain(market, q);
+
+        if (this.config.liveTrading && this.activePendingOrder) {
+            const placedMs = Date.parse(this.activePendingOrder.placedAt);
+            const ageMs = Number.isFinite(placedMs) ? Date.now() - placedMs : MAX_PENDING_ORDER_AGE_MS + 1;
+            if (ageMs <= MAX_PENDING_ORDER_AGE_MS) {
                 const ws = this.windowState!;
                 updateDashboardState({
                     ...this.getDashboardExtras(),
@@ -856,10 +907,7 @@ export class HedgeBot {
             }
         }
 
-        if (this.config.liveTrading) {
-            if (this.lastBalanceFetchTs === 0) await this.fetchBalance();
-            await this.fetchActualPosition(market);
-        } else {
+        if (!this.config.liveTrading) {
             this.cachedBalances.polymarketUsdc = getSimulatedBalance();
             this.cachedBalances.totalUsdc = getSimulatedBalance();
         }

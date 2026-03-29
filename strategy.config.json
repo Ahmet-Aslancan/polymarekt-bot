@@ -2,7 +2,7 @@
   "btcMarketWindowMinutes": 5,
   "targetPairCostMax": 0.995,
   "safetyMargin": 0.98,
-  "maxPositionPerWindowUsd": 10000,
+  "maxPositionPerWindowUsd": 5000,
   "orderSizeShares": 2000,
   "orderMinSize": 5,
   "tickSize": 0.01,
@@ -14,7 +14,7 @@
   "killSwitch": false,
   "circuitBreakerFailures": 5,
   "feeBips": 10,
-  "maxSingleOrderUsd": 500,
+  "maxSingleOrderUsd": 100,
   "orderSpendBalanceFraction": 0.05,
   "maxClipShares": 1000,
   "sizeLadderShares": [20, 100, 250, 500, 1000],
@@ -23,5 +23,5 @@
   "pairTiltImbalanceShares": 10,
   "pairTiltMinElapsedSeconds": 45,
   "quietConsole": false,
-  "paperStartingBalanceUsd": 4951
+  "paperStartingBalanceUsd": 5300
 }
